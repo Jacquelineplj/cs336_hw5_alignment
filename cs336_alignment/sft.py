@@ -2,11 +2,16 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from vllm import LLM, SamplingParams
 import wandb
 import torch
-from cs336_alignment.utils import tokenize_prompt_and_output
+from cs336_alignment.utils import *
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
 import random
 from argparse import ArgumentParser
+import re
+from typing import Callable, List
+from unittest.mock import patch
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+
 
 
 QWEN_MATH_BASE_PATH = 'models/Qwen2.5-Math-1.5B'
@@ -67,7 +72,8 @@ def format_qa(data:list[str], prompt_path:str)->list[str]:
         extracted_answer = extract_reference_answer(d["answer"])
         pair = {}
         pair["prompt"] = prompt.format(question = d["question"])
-        pair["answer"] = d["answer"] + "</think> <answer>" + extracted_answer+ "</answer>"
+        reasoning = ANS_RE.sub("", d["answer"]).strip()
+        pair["answer"] = reasoning + " </think> <answer>" + extracted_answer + "</answer>"
         formated_q.append(pair)
     return formated_q
 
@@ -134,7 +140,7 @@ def sft_model(model:torch.nn.Module, input_ids:torch.Tensor, labels:torch.Tensor
     return loss, entropy, metadata
 
 
-def train(train_samples: int, dataset_type: str):
+def train(train_sample: int, dataset_type: str):
         wandb.init(project="cs336-sft",
         name=f"train_sample_{train_sample}_dataset_{dataset_type}_math_sft",
         config={
@@ -153,7 +159,7 @@ def train(train_samples: int, dataset_type: str):
         #prepare dataset
         train_qa, test_prompt = perpare_dataset(train_sample)
         tokenized_train_data = tokenize_prompt_and_output(prompt_strs=[data["prompt"] for data in train_qa],
-                                                    output_strs=[data["response"] for data in train_qa],
+                                                    output_strs=[data["answer"] for data in train_qa],
                                                     tokenizer=tokenizer)
         train_batch = get_batch(tokenized_train_data, micro_batch_size, device_train)
         input_ids = train_batch["input_ids"].to(device_train)
@@ -179,11 +185,11 @@ def train(train_samples: int, dataset_type: str):
             for j_grad_accum_step in range(n_grad_accum_steps):
                 with amp_ctx:
                     loss, entropy, metadata = sft_model(model, input_ids, labels, response_mask, n_grad_accum_steps)
-                    loss_list.append(loss)
+                    loss_list.append(loss.item())
                     entropy_list.append(entropy.mean().item())
-                    metadata_list.append(metadata)
                     response_tokens_list.append(metadata["response_tokens"])
                     mask_fraction_list.append(metadata["mask_fraction"])
+
                     if j_grad_accum_step == n_grad_accum_steps - 1:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
@@ -199,11 +205,16 @@ def train(train_samples: int, dataset_type: str):
                         print (f"mask_fraction: {mask_fraction}")
                         wandb.log({
                             "train/loss": to_float(loss),
-                            "train/entropy": to_float(entropy.mean()),
+                            "train/entropy": to_float(entropy),
                             "train/response_tokens": response_tokens,
                             "train/mask_fraction": mask_fraction,
                             "train_step": i_sft_step + 1
                         })
+                train_batch = get_batch(tokenized_train_data, micro_batch_size, device_train)
+                input_ids = train_batch["input_ids"].to(device_train)
+                labels = train_batch["labels"].to(device_train)
+                response_mask = train_batch["response_mask"].to(device_train)
+
             if i_sft_step % eval_steps == 0:
                 load_policy_into_vllm_instance(model, vllm)
                 sampling_params = SamplingParams(
@@ -242,4 +253,4 @@ if __name__ == "__main__":
     dataset_type = "raw"
     train_samples = [128, 256, 512, 1024]
     for train_sample in train_samples:
-        main(train_sample, dataset_type)
+        train(train_sample, dataset_type)

@@ -76,20 +76,24 @@ def main():
             for j_grad_accum_step in range(n_grad_accum_steps):
                 with amp_ctx:
                     loss, entropy, metadata = sft_model(model, input_ids_batch, labels_batch, response_mask_batch, n_grad_accum_steps)
-                    loss_list.append(loss)
+                    loss_list.append(loss.item())
                     entropy_list.append(entropy.mean().item())
                     response_tokens_list.append(metadata["response_tokens"])
                     mask_fraction_list.append(metadata["mask_fraction"])
                     
+                    entropy = sum(entropy_list) / n_grad_accum_steps
+                    response_tokens = sum(response_tokens_list) / n_grad_accum_steps
+                    mask_fraction = sum(mask_fraction_list) / n_grad_accum_steps
+
                     if j_grad_accum_step == n_grad_accum_steps - 1:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
                         optimizer.zero_grad()
                         print (f"Training summary at step {global_step + 1}:")
                         print (f"loss: {loss:.6f}")
-                        print (f"Global Entropy: {entropy.mean().item():.6f}")
-                        print (f"response_tokens: {metadata["response_tokens"]}")
-                        print (f"mask_fraction: {metadata["mask_fraction"]}")
+                        print (f"Global Entropy: {entropy:.6f}")
+                        print (f"response_tokens: {response_tokens}")
+                        print (f"mask_fraction: {mask_fraction}")
             
             global_step += 1
             if (global_step % eval_steps == 0):
