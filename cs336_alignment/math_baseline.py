@@ -23,12 +23,14 @@ def build_prompts(prompts_path: str, data_path: str) -> List[str]:
         prompt_template = f.read()
     prompts = []
     answers = []
+    questions = []
     with open(data_path, "r") as f:
         for line in f:
             data = json.loads(line)
             prompts.append(prompt_template.format(question=data["question"]))
             answers.append(data["answer"])
-    return prompts, answers
+            questions.append(data["question"])
+    return prompts, answers, questions
 
 
 def evaluate_vllm(
@@ -36,16 +38,19 @@ def evaluate_vllm(
     reward_fn: Callable[[str, str], dict[str, float]],
     prompts: List[str],
     answers: List[str],
-    eval_sampling_params: SamplingParams) -> None:
+    eval_sampling_params: SamplingParams,
+    questions: List[str]
+    ) -> None:
     """
     Evaluate a language model on a list of prompts,
     compute evaluation metrics, and serialize results to disk.
     """
     responses = vllm_model.generate(prompts, eval_sampling_params)
     results = []
-    for response, prompt, answer in zip(responses, prompts, answers):
+    for response, prompt, answer, question in zip(responses, prompts, answers, questions):
         extracted_answer = extract_reference_answer(answer)
         reward_dict = reward_fn(response.outputs[0].text, extracted_answer)
+        reward_dict["question"] = question
         reward_dict["prompt"] = prompt
         reward_dict["answer"] = answer
         reward_dict["extracted_answer"] = extracted_answer
@@ -81,14 +86,14 @@ def calculate_metrics(results: List[dict], debug: bool = False) -> dict:
 def main():
     model_path = "models/Qwen2.5-Math-1.5B"
     llm, sampling_params = create_vllm_model(model_path)
-    prompts, answers = build_prompts("cs336_alignment/prompts/r1_zero.prompt", "data/gsm8k/test.jsonl")
-    results = evaluate_vllm(llm, r1_zero_reward_fn, prompts, answers, sampling_params)
+    prompts, answers, questions = build_prompts("cs336_alignment/prompts/r1_zero.prompt", "data/gsm8k/train.jsonl")
+    results = evaluate_vllm(llm, r1_zero_reward_fn, prompts, answers, sampling_params, questions)
     os.makedirs("results", exist_ok=True)
-    with open("results/math_baseline_results.jsonl", "w") as f:
+    with open("results/math_baseline_train_results.jsonl", "w") as f:
         for result in results:
             json.dump(result, f)
             f.write('\n')
-    print(f"Saved {len(results)} results to results/math_baseline_results.jsonl")
+    print(f"Saved {len(results)} results to results/math_baseline_train_results.jsonl")
     metrics = calculate_metrics(results, debug=True)
     print(metrics)
 

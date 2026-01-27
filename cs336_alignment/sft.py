@@ -11,6 +11,7 @@ import re
 from typing import Callable, List
 from unittest.mock import patch
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+import time
 
 
 
@@ -20,12 +21,13 @@ EVAL_DATASET_PATH = "data/gsm8k/test.jsonl"
 PROMPT_PATH = 'cs336_alignment/prompts/r1_zero.prompt'
 OUTPUT_PATH = "models/sft_model"
 SEED = 69
-n_sft_steps = 256
-n_grad_accum_steps = 8
+n_sft_steps = 128
+n_grad_accum_steps = 16
 eval_steps = 16
 device_train = "cuda:0"
 device_vllm = "cuda:1"
-micro_batch_size = 8
+micro_batch_size = 4
+from tqdm import tqdm
 
 ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
 def extract_reference_answer(answer: str) -> str:
@@ -141,11 +143,12 @@ def sft_model(model:torch.nn.Module, input_ids:torch.Tensor, labels:torch.Tensor
 
 
 def train(train_sample: int, dataset_type: str):
-        wandb.init(project="cs336-sft",
+        run = wandb.init(project="cs336-sft",
         name=f"train_sample_{train_sample}_dataset_{dataset_type}_math_sft",
         config={
             "train_sample": train_sample,
-            "dataset_type": dataset_type
+            "dataset_type": dataset_type,
+            'batch_size': micro_batch_size*n_grad_accum_steps
             }
         )
 
@@ -177,7 +180,7 @@ def train(train_sample: int, dataset_type: str):
 
         amp_ctx = torch.amp.autocast(device_type=device_train, dtype=torch.bfloat16)
         vllm = init_vllm(QWEN_MATH_BASE_PATH, device_vllm, SEED, gpu_memory_utilization=0.9)
-        for i_sft_step in range(n_sft_steps):
+        for i_sft_step in tqdm(range(n_sft_steps), desc="Training"):
             loss_list = []
             entropy_list = []
             response_tokens_list = []
@@ -244,13 +247,15 @@ def train(train_sample: int, dataset_type: str):
                 model.save_pretrained(save_directory=OUTPUT_PATH)
                 tokenizer.save_pretrained(save_directory=OUTPUT_PATH)
 
-
+        run.finish()
 
 
 
     
 if __name__ == "__main__":
     dataset_type = "raw"
-    train_samples = [128, 256, 512, 1024]
+    train_samples = [256, 512, 1024, 7473]
     for train_sample in train_samples:
+        print (f"Training with {train_sample} samples")
         train(train_sample, dataset_type)
+        time.sleep(10)

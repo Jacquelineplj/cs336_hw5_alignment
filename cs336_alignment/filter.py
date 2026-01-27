@@ -5,7 +5,7 @@ def main():
     format_correct_answer_wrong = []
     format_wrong_answer_correct = []
     format_wrong_answer_wrong = []
-    with open("baseline_result.jsonl") as f:
+    with open("results/math_baseline_train_results.jsonl") as f:
         for line in f:
             line = json.loads(line.strip())
             if line["format_reward"] == 1 and line["answer_reward"] == 1:
@@ -27,3 +27,6 @@ def main():
         for i in correct_dict_list:
             json.dump(i, f)
             f.write("\n")
+
+if __name__ == "__main__":
+    main()

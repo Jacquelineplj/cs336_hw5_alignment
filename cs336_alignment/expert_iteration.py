@@ -1,8 +1,19 @@
-from cs336.math_baseline import evaluate_vllm,build_prompts,calculate_metrics
-from cs336.utils import tokenize_prompt_and_output
-from transformers import PreTrainedTokenizerBase
-from cs336.sft import load_policy_into_vllm_instance,init_vllm
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
+from vllm import LLM, SamplingParams
+import wandb
+import torch
+from cs336_alignment.utils import *
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import json
+import random
+from argparse import ArgumentParser
+import re
+from typing import Callable, List
+from unittest.mock import patch
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.math_baseline import evaluate_vllm,build_prompts,calculate_metrics
+from cs336_alignment.sft import load_policy_into_vllm_instance,init_vllm
+
 
 DATASET_PATH = "data/gsm8k/train.jsonl"
 PROMPT_PATH = "cs336_alignment/prompts/r1_zero.prompt"
@@ -24,16 +35,16 @@ def generate_data(
     eval_sampling_params: SamplingParams):
 
     info_dict_list = evaluate_vllm(vllm_model, reward_fn, prompts, answers, eval_sampling_params)
-    fully_correct = [result for result in results if result["reward"] == 1.0]
+    fully_correct = [result for result in info_dict_list if result["reward"] == 1.0]
     prompt = [result["prompt"] for result in fully_correct]
     response = [result["response"] for result in fully_correct]
     return prompt, response
 
 def get_train_data(prompt:List[str], response:List[str], tokenizer:PreTrainedTokenizerBase) -> List[str]:
     tokenized_train_data = tokenize_prompt_and_output(prompt_strs=prompt,output_strs=response,tokenizer=tokenizer)
-    input_ids = train_batch["input_ids"].to(device_train)
-    labels = train_batch["labels"].to(device_train)
-    response_mask = train_batch["response_mask"].to(device_train)
+    input_ids = train_tokenized_train_databatch["input_ids"].to(device_train)
+    labels = tokenized_train_data["labels"].to(device_train)
+    response_mask = tokenized_train_data["response_mask"].to(device_train)
     return input_ids, labels, response_mask
 
 def vllm_loop(model:torch.nn.Module, vllm:LLM, tokenizer:PreTrainedTokenizerBase, dataset_path:str):
@@ -42,6 +53,9 @@ def vllm_loop(model:torch.nn.Module, vllm:LLM, tokenizer:PreTrainedTokenizerBase
                     temperature = 1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
                 )
     prompt, answer = build_prompts(PROMPT_PATH, dataset_path)
+    sampling_params = SamplingParams(
+                    temperature = 1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
+                )
     prompt, response = generate_data(vllm, r1_zero_reward_fn, prompt, answer, sampling_params)
     input_ids, labels, response_mask = get_train_data(prompt, response, tokenizer)
     return input_ids, labels, response_mask
@@ -54,6 +68,17 @@ def get_batch(input_ids:torch.Tensor, labels:torch.Tensor, response_mask:torch.T
     return input_ids, labels, response_mask
 
 def main():
+    wandb.init(project="cs336-sft",
+        name=f"expert_iteration",
+        config={
+            'batch_size': micro_batch_size*n_grad_accum_steps
+            }
+        )
+    wandb.define_metric("train_step")
+    wandb.define_metric("eval_step")
+    wandb.define_metric("train/*", step_metric="train_step")
+    wandb.define_metric("eval/*", step_metric="eval_step")
+
     model = AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=QWEN_MATH_BASE_PATH,
         torch_dtype=torch.bfloat16,
@@ -72,8 +97,9 @@ def main():
             response_tokens_list = []
             mask_fraction_list = []
 
-            input_ids_batch, labels_batch, response_mask_batch = get_batch(input_ids, labels, response_mask)
+            
             for j_grad_accum_step in range(n_grad_accum_steps):
+                input_ids_batch, labels_batch, response_mask_batch = get_batch(input_ids, labels, response_mask)
                 with amp_ctx:
                     loss, entropy, metadata = sft_model(model, input_ids_batch, labels_batch, response_mask_batch, n_grad_accum_steps)
                     loss_list.append(loss.item())
@@ -81,14 +107,15 @@ def main():
                     response_tokens_list.append(metadata["response_tokens"])
                     mask_fraction_list.append(metadata["mask_fraction"])
                     
-                    entropy = sum(entropy_list) / n_grad_accum_steps
-                    response_tokens = sum(response_tokens_list) / n_grad_accum_steps
-                    mask_fraction = sum(mask_fraction_list) / n_grad_accum_steps
 
                     if j_grad_accum_step == n_grad_accum_steps - 1:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
                         optimizer.zero_grad()
+
+                        entropy = sum(entropy_list) / n_grad_accum_steps
+                        response_tokens = sum(response_tokens_list) / n_grad_accum_steps
+                        mask_fraction = sum(mask_fraction_list) / n_grad_accum_steps
                         print (f"Training summary at step {global_step + 1}:")
                         print (f"loss: {loss:.6f}")
                         print (f"Global Entropy: {entropy:.6f}")
@@ -99,7 +126,7 @@ def main():
             if (global_step % eval_steps == 0):
                 load_policy_into_vllm_instance(model, vllm)
 
-                test_prompt, test_answer = build_prompts(PROMPT_PATH, EVAL_DATASET_PATH)
+                test_prompt, test_answer, _ = build_prompts(PROMPT_PATH, EVAL_DATASET_PATH)
                 overview = evaluate_vllm(vllm, r1_zero_reward_fn, test_prompt, test_answer, sampling_params)
                 overview = calculate_metrics(overview)
 
@@ -115,7 +142,9 @@ def main():
                     "eval/wrong format": overview["fully_wrong"],
                     "eval/accuracy": overview["fully_correct"] / overview["total"],
                     "eval_step": global_step+1
-                }
+                })
 
                 model.save_pretrained(save_directory=OUTPUT_PATH)
                 tokenizer.save_pretrained(save_directory=OUTPUT_PATH)
+if __name__ == "__main__":
+    main()
