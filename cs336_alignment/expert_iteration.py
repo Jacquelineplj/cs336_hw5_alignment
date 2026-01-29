@@ -12,7 +12,7 @@ from typing import Callable, List
 from unittest.mock import patch
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.math_baseline import evaluate_vllm,build_prompts,calculate_metrics
-from cs336_alignment.sft import load_policy_into_vllm_instance,init_vllm
+from cs336_alignment.sft import load_policy_into_vllm_instance,init_vllm,extract_reference_answer,sft_model
 
 
 DATASET_PATH = "data/gsm8k/train.jsonl"
@@ -20,12 +20,19 @@ PROMPT_PATH = "cs336_alignment/prompts/r1_zero.prompt"
 QWEN_MATH_BASE_PATH = 'models/Qwen2.5-Math-1.5B'
 TRAIN_DATASET_PATH = "data/gsm8k/train.jsonl"
 EVAL_DATASET_PATH = "data/gsm8k/test.jsonl"
+OUTPUT_PATH = "models/expert_iteration_model"
 n_ei_steps = 5
-micro_batch_size = 8
-n_grad_accum_steps = 8
+micro_batch_size = 4
+n_grad_accum_steps = 64
+n_sft_steps = 128
+eval_steps = 5
 device_train = "cuda:0"
 device_vllm = "cuda:1"
 SEED = 69
+ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
+sampling_params = SamplingParams(
+                    temperature = 1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
+                )
 
 def generate_data(
     vllm_model: LLM,
@@ -42,20 +49,14 @@ def generate_data(
 
 def get_train_data(prompt:List[str], response:List[str], tokenizer:PreTrainedTokenizerBase) -> List[str]:
     tokenized_train_data = tokenize_prompt_and_output(prompt_strs=prompt,output_strs=response,tokenizer=tokenizer)
-    input_ids = train_tokenized_train_databatch["input_ids"].to(device_train)
+    input_ids = tokenized_train_data["input_ids"].to(device_train)
     labels = tokenized_train_data["labels"].to(device_train)
     response_mask = tokenized_train_data["response_mask"].to(device_train)
     return input_ids, labels, response_mask
 
 def vllm_loop(model:torch.nn.Module, vllm:LLM, tokenizer:PreTrainedTokenizerBase, dataset_path:str):
     load_policy_into_vllm_instance(model, vllm)
-    sampling_params = SamplingParams(
-                    temperature = 1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
-                )
-    prompt, answer = build_prompts(PROMPT_PATH, dataset_path)
-    sampling_params = SamplingParams(
-                    temperature = 1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
-                )
+    prompt, answer, _ = build_prompts(PROMPT_PATH, dataset_path)
     prompt, response = generate_data(vllm, r1_zero_reward_fn, prompt, answer, sampling_params)
     input_ids, labels, response_mask = get_train_data(prompt, response, tokenizer)
     return input_ids, labels, response_mask
@@ -67,9 +68,33 @@ def get_batch(input_ids:torch.Tensor, labels:torch.Tensor, response_mask:torch.T
     response_mask = response_mask[batch_indices]
     return input_ids, labels, response_mask
 
+
+def evaluate_vllm(
+    vllm_model: LLM,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    prompts: List[str],
+    answers: List[str],
+    eval_sampling_params: SamplingParams
+    ) -> None:
+    """
+    Evaluate a language model on a list of prompts,
+    compute evaluation metrics, and serialize results to disk.
+    """
+    responses = vllm_model.generate(prompts, eval_sampling_params)
+    results = []
+    for response, prompt, answer in zip(responses, prompts, answers):
+        extracted_answer = extract_reference_answer(answer)
+        reward_dict = reward_fn(response.outputs[0].text, extracted_answer)
+        reward_dict["prompt"] = prompt
+        reward_dict["answer"] = answer
+        reward_dict["extracted_answer"] = extracted_answer
+        reward_dict["response"] = response.outputs[0].text
+        results.append(reward_dict)
+    return results
+
 def main():
     wandb.init(project="cs336-sft",
-        name=f"expert_iteration",
+        name=f"expert_iteration_batch_size_{micro_batch_size*n_grad_accum_steps}",
         config={
             'batch_size': micro_batch_size*n_grad_accum_steps
             }
@@ -85,12 +110,15 @@ def main():
         attn_implementation="flash_attention_2",
         device_map=device_train
     )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
     vllm = init_vllm(QWEN_MATH_BASE_PATH, device_vllm, SEED, gpu_memory_utilization=0.9)
     tokenizer = AutoTokenizer.from_pretrained(QWEN_MATH_BASE_PATH)
     amp_ctx = torch.amp.autocast(device_type=device_train, dtype=torch.bfloat16)
     global_step = 0
     for i_ei_step in range(n_ei_steps):
         input_ids, labels, response_mask = vllm_loop(model, vllm, tokenizer, TRAIN_DATASET_PATH)
+        # input_ids, labels, response_mask = vllm_loop(model, vllm, tokenizer, EVAL_DATASET_PATH)
+
         for i_sft_step in range(n_sft_steps):
             loss_list = []
             entropy_list = []
@@ -121,6 +149,13 @@ def main():
                         print (f"Global Entropy: {entropy:.6f}")
                         print (f"response_tokens: {response_tokens}")
                         print (f"mask_fraction: {mask_fraction}")
+                        wandb.log({
+                            "train/loss": loss,
+                            "train/entropy": entropy,
+                            "train/response_tokens": response_tokens,
+                            "train/mask_fraction": mask_fraction,
+                            "train_step": global_step + 1
+                        })
             
             global_step += 1
             if (global_step % eval_steps == 0):
@@ -138,7 +173,7 @@ def main():
 
                 wandb.log({
                     "eval/correct": overview["fully_correct"],  
-                    "eval/correct format with wrong answer": overview["only_format_correct"],
+                    "eval/wrong format": overview["only_format_correct"],
                     "eval/wrong format": overview["fully_wrong"],
                     "eval/accuracy": overview["fully_correct"] / overview["total"],
                     "eval_step": global_step+1

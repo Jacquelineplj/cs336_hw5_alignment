@@ -18,6 +18,7 @@ import time
 QWEN_MATH_BASE_PATH = 'models/Qwen2.5-Math-1.5B'
 TRAIN_DATASET_PATH = "data/gsm8k/train.jsonl"
 EVAL_DATASET_PATH = "data/gsm8k/test.jsonl"
+CORRECT_DATASET_PATH = "data/gsm8k/train_correct.jsonl"
 PROMPT_PATH = 'cs336_alignment/prompts/r1_zero.prompt'
 OUTPUT_PATH = "models/sft_model"
 SEED = 69
@@ -58,6 +59,7 @@ def load_policy_into_vllm_instance(policy: torch.nn.Module, llm:LLM):
     state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
+    del state_dict
 
 def load_jsonl(file_path:str)->list[str]:
     data = []
@@ -79,8 +81,11 @@ def format_qa(data:list[str], prompt_path:str)->list[str]:
         formated_q.append(pair)
     return formated_q
 
-def perpare_dataset(train_sample: int):
-    train_data = load_jsonl(TRAIN_DATASET_PATH)
+def perpare_dataset(train_sample: int, dataset_type: str):
+    if dataset_type == "raw":
+        train_data = load_jsonl(TRAIN_DATASET_PATH)
+    if dataset_type == "correct":
+        train_data = load_jsonl(CORRECT_DATASET_PATH)
     train_data = train_data[:train_sample]
     train_data = format_qa(train_data, PROMPT_PATH)
 
@@ -160,7 +165,7 @@ def train(train_sample: int, dataset_type: str):
         tokenizer = AutoTokenizer.from_pretrained(QWEN_MATH_BASE_PATH)
 
         #prepare dataset
-        train_qa, test_prompt = perpare_dataset(train_sample)
+        train_qa, test_prompt = perpare_dataset(train_sample, dataset_type)
         tokenized_train_data = tokenize_prompt_and_output(prompt_strs=[data["prompt"] for data in train_qa],
                                                     output_strs=[data["answer"] for data in train_qa],
                                                     tokenizer=tokenizer)
@@ -218,7 +223,7 @@ def train(train_sample: int, dataset_type: str):
                 labels = train_batch["labels"].to(device_train)
                 response_mask = train_batch["response_mask"].to(device_train)
 
-            if i_sft_step % eval_steps == 0:
+            if (i_sft_step + 1) % eval_steps == 0:
                 load_policy_into_vllm_instance(model, vllm)
                 sampling_params = SamplingParams(
                     temperature = 1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
@@ -253,9 +258,8 @@ def train(train_sample: int, dataset_type: str):
 
     
 if __name__ == "__main__":
-    dataset_type = "raw"
-    train_samples = [256, 512, 1024, 7473]
+    dataset_type = "correct"
+    train_samples = [247]
     for train_sample in train_samples:
         print (f"Training with {train_sample} samples")
         train(train_sample, dataset_type)
-        time.sleep(10)
