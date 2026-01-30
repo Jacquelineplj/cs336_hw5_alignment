@@ -28,16 +28,16 @@ group_size: int = 8
 sampling_temperature: float = 1.0
 sampling_min_tokens: int = 4 # As in Expiter, disallow empty string responses
 sampling_max_tokens: int = 1024
-epochs_per_rollout_batch: int = 1 # On-policy
+epochs_per_rollout_batch: int = 3 # On-policy
 train_batch_size: int = 256 # On-policy
-gradient_accumulation_steps: int = 128 # microbatch size is 4, will fit on H100
+gradient_accumulation_steps: int = 128 # microbatch size is 2, will fit on H100
 gpu_memory_utilization: float = 0.85
 eval_steps: int = 10
 loss_type: Literal[
 "no_baseline",
 "reinforce_with_baseline",
 "grpo_clip",
-] = "reinforce_with_baseline"
+] = "grpo_clip"
 use_std_normalization: bool = True
 cliprange: float = 0.2
 SEED = 69
@@ -65,19 +65,19 @@ def sample_qa_pairs(sample_size: int):
     idx = random.sample(range(len(prompts)), sample_size)
     return [prompts[i] for i in idx], [answers[i] for i in idx]
 
-def grpo_model(model:torch.nn.Module, input_ids:torch.Tensor, labels:torch.Tensor, response_mask:torch.Tensor, old_log_probs:torch.Tensor, raw_rewards:torch.Tensor, advantages:torch.Tensor, cliprange:float, masked_mean: bool = True):
+def grpo_model(model:torch.nn.Module, input_ids:torch.Tensor, labels:torch.Tensor, response_mask:torch.Tensor, old_log_probs:torch.Tensor, raw_rewards:torch.Tensor, advantages:torch.Tensor, cliprange:float, use_masked_mean: bool = True):
     out = get_response_log_probs(model, input_ids, labels, return_token_entropy=True)
     policy_log_probs,token_entropy = out["log_probs"], out["token_entropy"]
-    if masked_mean:
+    if use_masked_mean:
         loss, metadata = grpo_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
     else:
         loss, metadata = grpo_microbatch_train_step_normalize(policy_log_probs, response_mask, gradient_accumulation_steps, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
     return loss, token_entropy, metadata
 
-def train(learning_rate: float, masked_mean: bool = True):
+def train(learning_rate: float, use_masked_mean: bool = True, epochs_per_rollout_batch: int = 3, train_batch_size: int = 128):
     print(f"learning_rate: {learning_rate}, masked_mean: {masked_mean}")
     run = wandb.init(project="cs336-grpo",
-    name=f"learning_rate_{learning_rate}_math_grpo_masked_mean_{masked_mean}",
+    name=f"learning_rate_{learning_rate}_math_grpo_masked_mean_{masked_mean}_epochs_per_rollout_batch_{epochs_per_rollout_batch}_train_batch_size_{train_batch_size}",
     config={
         "learning_rate": learning_rate,
         }
@@ -122,6 +122,13 @@ def train(learning_rate: float, masked_mean: bool = True):
         raw_rewards = rewards.unsqueeze(-1)
 
         input_ids, labels, response_mask = get_train_data(prompts, responses, tokenizer)
+        print ("---------examples of prompt, response, answer-----------")
+        for i in range(3):
+            print (f"prompt:{prompts[i]}")
+            print (f"rollouts:{responses[i]}")
+            print (f"answers:{answers[i]}")
+            print (f"reward:{raw_rewards[i].item():.6f}")
+        print ("--------grpo step rollout example done")
 
         for i_epochs_per_rollout_batch in range(epochs_per_rollout_batch):
             chunk = 6
@@ -158,32 +165,41 @@ def train(learning_rate: float, masked_mean: bool = True):
                     if (i_microbatches_per_rollout_batch+1) % gradient_accumulation_steps == 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         if loss_type == "grpo_clip":
-                            clip_fraction = masked_mean(metadata["is_clipped"], response_mask_batch, dim = -1)/response_mask_batch.sum(dim = -1)
-                            clip_fraction = clip_fraction.mean().item()
+                            clip_fraction = (metadata["is_clipped"] & response_mask_batch).sum() / response_mask_batch.sum()
+                            clip_fraction = clip_fraction.item()
                         optimizer.step()
                         optimizer.zero_grad()
 
-                        loss = sum(loss_list) / len(loss_list)
-                        entropy = sum(entropy_list) / len(entropy_list)
-                        rewards_mean = sum(rewards_list) / len(rewards_list)
+                        # 只使用最近 gradient_accumulation_steps 个 microbatches 的数据
+                        recent_loss_list = loss_list[-gradient_accumulation_steps:]
+                        recent_entropy_list = entropy_list[-gradient_accumulation_steps:]
+                        recent_rewards_list = rewards_list[-gradient_accumulation_steps:]
+                        
+                        loss = sum(recent_loss_list) / len(recent_loss_list)
+                        entropy = sum(recent_entropy_list) / len(recent_entropy_list)
+                        rewards_mean = sum(recent_rewards_list) / len(recent_rewards_list)
                         print (f"Training summary at step {global_step + 1}:")
                         print (f"loss: {loss:.6f}")
                         print (f"Global Entropy: {entropy:.6f}")
                         print (f"Grad Norm: {grad_norm.item():.6f}")
                         print (f"Rewards Mean: {rewards_mean:.6f}")
-                        wandb.log({
+                        log_dict = {
                             "train/loss": loss,
                             "train/entropy": entropy,
                             "train/grad_norm": grad_norm.item(),
                             "train_step": global_step + 1,
                             "train/rewards_mean": rewards_mean,
-                        })
+                        }
                         if loss_type == "grpo_clip":
-                            wandb.log({
-                                "train/clip_fraction": clip_fraction,
-                            })
+                            log_dict["train/clip_fraction"] = clip_fraction
+                        wandb.log(log_dict)
             
-                        global_step += 1        
+                        global_step += 1
+                        
+                        # 清空列表，为下一个梯度累积步骤做准备
+                        loss_list.clear()
+                        entropy_list.clear()
+                        rewards_list.clear()        
 
                         if (global_step % eval_steps == 0):
 
